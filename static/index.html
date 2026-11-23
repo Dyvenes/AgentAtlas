@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Atlas</title>
+<style>
+  :root {
+    --world: #080B19;
+    --mist: #162343;
+    --text: #EDF5FF;
+    --cyan: #52E6FF;
+    --pink: #FF67D8;
+    --violet: #9F8BFF;
+    --amber: #FFD27A;
+    --error: #FF667D;
+  }
+  html, body { margin: 0; height: 100%; background: var(--world); color: var(--text); font-family: "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  #dust { position: fixed; inset: 0; z-index: 1; pointer-events: none; }
+  #scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; z-index: 2; }
+  #scene .node { cursor: pointer; }
+  #scene .label { font-size: 13px; fill: var(--text); opacity: 0.9; pointer-events: none; }
+  #scene .stale-badge, #scene .ended-check, #scene .error-bang { font-size: 13px; font-weight: 700; pointer-events: none; }
+  #scene .stale-badge { fill: #889; opacity: 0; }
+  #scene .node.stale .stale-badge { opacity: 1; }
+  #scene .ended-check { fill: var(--cyan); }
+  #scene .error-bang { fill: var(--error); }
+  #scene .edge { fill: none; stroke: var(--cyan); stroke-width: 1; opacity: 0.18; }
+  #scene .edge.uses { stroke: var(--pink); }
+  #scene .edge.writes { stroke: var(--amber); }
+  #scene .edge.requests { stroke: var(--cyan); }
+  #scene .edge.spawns { stroke: var(--violet); }
+  #scene .edge.spawns-collapsed {
+    stroke-dasharray: 3 4;
+    opacity: 0.55;
+  }
+  #scene .edge.active { stroke-width: 1.8; opacity: 0.75; filter: url(#glow); }
+  #scene .impulse {
+  pointer-events: none;
+  filter: url(#impulseGlow);
+}
+  #scene .node.status-active .aura { animation: aura-pulse 1.8s ease-in-out infinite; }
+  #scene .node.status-idle .aura { opacity: 0.4; }
+  #scene .node.status-sleeping .aura { opacity: 0.15; }
+  #scene .node.status-ended { opacity: 0.35; }
+  #scene .node.status-error .aura { fill: var(--error); opacity: 0.7; }
+  #scene .node.status-error { animation: error-shake 450ms ease-out 1; }
+  #scene .node.stale { opacity: 0.65; }
+  @keyframes aura-pulse {
+    0%, 100% { opacity: 0.25; transform: scale(1); }
+    50% { opacity: 0.75; transform: scale(1.06); }
+  }
+  @keyframes error-shake {
+    0% { transform: translate(0,0); }
+    25% { transform: translate(4px,-3px); }
+    50% { transform: translate(-4px,3px); }
+    75% { transform: translate(2px,2px); }
+    100% { transform: translate(0,0); }
+  }
+
+  @keyframes drift {
+    0%, 100% { transform: translate(0, 0); }
+    25%      { transform: translate(var(--amp, 4px), calc(var(--amp, 4px) * -0.6)); }
+    50%      { transform: translate(0, calc(var(--amp, 4px) * -1)); }
+    75%      { transform: translate(calc(var(--amp, 4px) * -1), calc(var(--amp, 4px) * -0.6)); }
+  }
+  .drift {
+    animation: drift var(--dur, 7s) ease-in-out infinite;
+    animation-delay: var(--delay, 0s);
+  }
+  /* Завершённые и ошибочные не парят — план: "без парения" / статичная эмблема */
+  .node.status-ended .drift,
+  .node.status-error .drift {
+    animation: none;
+  }
+
+  #menu-btn {
+    position: fixed; top: 16px; left: 16px; z-index: 20;
+    width: 44px; height: 44px; border-radius: 12px;
+    background: rgba(22,35,67,0.85); border: 1px solid rgba(82,230,255,0.4);
+    color: var(--text); font-size: 22px; cursor: pointer;
+    backdrop-filter: blur(8px);
+  }
+  #menu-panel {
+    position: fixed; top: 70px; left: 16px; z-index: 20;
+    background: rgba(8,11,25,0.92); border: 1px solid rgba(82,230,255,0.3);
+    border-radius: 12px; padding: 12px; min-width: 240px;
+    backdrop-filter: blur(12px); font-size: 13px;
+  }
+  #menu-panel[hidden] { display: none; }
+  #menu-panel .row { display: flex; justify-content: space-between; padding: 4px 0; color: #9fb2d4; }
+  #menu-panel .row b { color: var(--text); }
+
+  #tooltip {
+    position: fixed; z-index: 30; pointer-events: none;
+    background: rgba(8,11,25,0.95); border: 1px solid var(--cyan);
+    color: var(--text); padding: 6px 10px; border-radius: 8px;
+    font-size: 12px; max-width: 280px;
+  }
+  #tooltip[hidden] { display: none; }
+
+  #card {
+    position: fixed; z-index: 15; min-width: 220px; max-width: 320px;
+    background: rgba(8,11,25,0.94); border: 1px solid rgba(82,230,255,0.4);
+    border-radius: 12px; padding: 12px 14px; font-size: 13px;
+    line-height: 1.5; backdrop-filter: blur(10px);
+  }
+  #card[hidden] { display: none; }
+  #card .muted { color: #8899b5; font-size: 12px; }
+
+  #drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 25;
+    width: min(420px, 90vw); background: rgba(8,11,25,0.97);
+    border-left: 1px solid rgba(82,230,255,0.3);
+    padding: 20px; overflow-y: auto; font-size: 13px;
+    transition: transform 320ms ease-out;
+  }
+  #drawer[hidden] { display: none; }
+  #drawer .kv { display: flex; gap: 8px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+  #drawer .kv span { color: #8899b5; min-width: 110px; }
+  #drawer code { color: var(--cyan); word-break: break-all; }
+
+  #accessible-list {
+    position: fixed; inset: 0; z-index: 5; pointer-events: none;
+    margin: 0; padding: 0; list-style: none;
+  }
+  #accessible-list button {
+    pointer-events: auto; opacity: 0; font-size: 1px;
+    width: 24px; height: 24px; transform: translate(-50%, -50%);
+    background: transparent; border: 0; color: transparent;
+  }
+  #accessible-list button:focus-visible {
+    opacity: 1; font-size: 12px; width: auto; height: auto;
+    background: rgba(8,11,25,0.95); border: 1px solid var(--cyan);
+    color: var(--text); padding: 4px 8px; border-radius: 6px;
+  }
+
+    #search-input {
+    width: 100%; box-sizing: border-box;
+    background: rgba(22,35,67,0.85); border: 1px solid rgba(82,230,255,0.3);
+    color: var(--text); padding: 6px 10px; border-radius: 8px;
+    font-size: 13px; outline: none; margin-bottom: 10px;
+  }
+  #search-input:focus { border-color: var(--cyan); }
+  #fit-btn {
+    width: 100%; margin-top: 10px;
+    background: rgba(22,35,67,0.85); border: 1px solid rgba(82,230,255,0.3);
+    color: var(--text); padding: 6px 10px; border-radius: 8px;
+    font-size: 13px; cursor: pointer;
+  }
+  #fit-btn:hover { border-color: var(--cyan); }
+
+  .drawer-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; padding-bottom: 8px;
+    border-bottom: 1px solid rgba(82,230,255,0.2);
+  }
+  .drawer-head span { font-weight: 600; font-size: 14px; }
+  #drawer-close {
+    background: transparent; border: 1px solid rgba(82,230,255,0.3);
+    color: var(--text); padding: 2px 10px; border-radius: 6px;
+    font-size: 16px; cursor: pointer;
+  }
+  #drawer-close:hover { border-color: var(--cyan); }
+
+  #scene { cursor: grab; }
+  #scene.panning { cursor: grabbing; }
+
+  /* Search highlight — ставим в конце, чтобы перекрыть статусные opacity */
+  #scene .node.search-dim { opacity: 0.15; }
+  #scene .node.search-match { opacity: 1; filter: drop-shadow(0 0 6px #52E6FF); }
+
+  @media (prefers-reduced-motion: reduce) {
+    #scene .node.status-active .aura,
+    #scene .node.status-error { animation: none !important; }
+    .drift { animation: none !important; }
+    #scene .impulse { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="dust"></canvas>
+<svg id="scene" viewBox="0 0 1080 1920" preserveAspectRatio="xMidYMid meet"></svg>
+<button id="menu-btn" aria-label="Меню">☰</button>
+<div id="menu-panel" hidden>
+  <input id="search-input" type="search" placeholder="Поиск по имени, id, провайдеру" autocomplete="off" />
+  <div class="row"><span>Узлов</span><b id="stat-nodes">0</b></div>
+  <div class="row"><span>Связей</span><b id="stat-edges">0</b></div>
+  <div class="row"><span>Окно ресурсов</span><b id="stat-window">—</b></div>
+  <button id="fit-btn" type="button">Показать всё</button>
+</div>
+<div id="tooltip" hidden></div>
+<div id="card" hidden></div>
+<aside id="drawer" hidden>
+  <div class="drawer-head">
+    <span>Детали</span>
+    <button id="drawer-close" type="button" aria-label="Закрыть">×</button>
+  </div>
+  <div id="drawer-body"></div>
+</aside>
+<ul id="accessible-list" aria-label="Все узлы"></ul>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
