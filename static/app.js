@@ -2,6 +2,8 @@ import { layoutScene, fitCamera } from "./layout.js";
 import { DustField } from "./dust.js";
 import { SceneRenderer } from "./render.js";
 import { truncateLabel, childrenMap, countDescendants, activeDescendantCount } from "./model.js";
+import { resolveStates } from "./state_resolver.js";
+import { EventQueue } from "./event_queue.js";
 
 const svg = document.getElementById("scene");
 const tooltip = document.getElementById("tooltip");
@@ -35,6 +37,11 @@ let drag = null;
 // Search: null = inactive, Set<id> = matching ids.
 let searchMatches = null;
 
+const eventQueue = new EventQueue(500);
+const pendingByAgent = new Map();   // agent_id → Set<call_id>
+const removedSet = new Set();
+let prevStates = new Map();
+
 const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 function topologySignature(snap) {
@@ -58,7 +65,12 @@ function fitView() {
 }
 
 function applySnapshot(snap) {
+  eventQueue.resetForSnapshot(snap.last_event_id);
   snapshot = snap;
+  const snapIds = new Set(snap.nodes.map((n) => n.id));
+  for (const id of [...removedSet]) {
+    if (!snapIds.has(id)) removedSet.delete(id);
+  }  
   const sig = topologySignature(snap);
   if (sig !== topologyKey) {
     topologyKey = sig;
@@ -72,15 +84,59 @@ function applySnapshot(snap) {
     cameraState = fitCamera(positions, window.innerWidth, window.innerHeight);
   }
   applyCamera();
-  renderer.update(snap, positions, {
-    expandedSet,
-    reducedMotion: prefersReducedMotion,
-    onSelect: selectNode,
-  });
+  reapplyStatesOnly();
   if (searchMatches) applySearchHighlight();
   refreshCard();
   refreshAccessibleList();
   updateMenuStats(snap);
+}
+
+function trackEvent(ev) {
+  if (ev.kind === "tool.started" && ev.call_id) {
+    if (!pendingByAgent.has(ev.source)) pendingByAgent.set(ev.source, new Set());
+    pendingByAgent.get(ev.source).add(ev.call_id);
+  } else if (ev.kind === "tool.completed" && ev.call_id) {
+    const s = pendingByAgent.get(ev.source);
+    if (s) {
+      s.delete(ev.call_id);
+      if (s.size === 0) pendingByAgent.delete(ev.source);
+    }
+  }
+}
+
+function reapplyStatesOnly() {
+  const states = resolveStates(snapshot, { now: Date.now(), pendingByAgent });
+
+  for (const [id, info] of states) {
+    if (info.state !== "Completed") continue;
+    if (prevStates.get(id)?.state === "Completed") continue;
+    if (removedSet.has(id)) continue;
+    const parentEdge = snapshot.edges.find((e) => e.target === id && e.relation === "spawns");
+    if (!parentEdge) continue;
+    renderer.playCompletion(id, parentEdge.source, () => {
+      removedSet.add(id);
+      reapplyStatesOnly();
+    });
+  }
+  prevStates = states;
+
+  renderer.update(snapshot, positions, {
+    expandedSet,
+    reducedMotion: prefersReducedMotion,
+    onSelect: selectNode,
+    states,
+    removed: removedSet,
+  });
+}
+
+function applyMessage(msg) {
+  if (msg.type === "event") {
+    if (!eventQueue.push(msg)) return;
+    trackEvent(msg);
+    reapplyStatesOnly();
+  } else if (msg.type === "snapshot" || msg.nodes) {
+    applySnapshot(msg);
+  }
 }
 
 function updateMenuStats(snap) {
@@ -98,11 +154,7 @@ function selectNode(id) {
   if (parentEdge && !expandedSet.has(id) && !node.stale
       && ["idle", "sleeping", "ended"].includes(node.status)) {
     expandedSet.add(id);
-    renderer.update(snapshot, positions, {
-      expandedSet,
-      reducedMotion: prefersReducedMotion,
-      onSelect: selectNode,
-    });
+    reapplyStatesOnly();
   }
   refreshCard();
   refreshDrawer();
@@ -304,13 +356,47 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") deselect();
 });
 
+
+window.atlas = {
+  animateCompletion(childId) {
+    const parentEdge = snapshot.edges.find((e) => e.target === childId && e.relation === "spawns");
+    if (!parentEdge) {
+      console.warn(`[atlas] ${childId} is not a child agent in current scene`);
+      return;
+    }
+    removedSet.delete(childId);
+    reapplyStatesOnly();
+    setTimeout(() => {
+      renderer.playCompletion(childId, parentEdge.source, () => {
+        removedSet.add(childId);
+        reapplyStatesOnly();
+        console.log(`[atlas] ${childId} removed after completion`);
+      });
+    }, 60);
+  },
+  restore(childId) {
+    removedSet.delete(childId);
+    reapplyStatesOnly();
+    console.log(`[atlas] ${childId} restored`);
+  },
+  removed() { return [...removedSet]; },
+  states() {
+    const out = {};
+    for (const [id, info] of prevStates) out[id] = info.state;
+    return out;
+  },
+};
+
 // WebSocket
 function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onmessage = (e) => applySnapshot(JSON.parse(e.data));
+  ws.onopen = () => {
+    pendingByAgent.clear();
+  };
+  ws.onmessage = (e) => applyMessage(JSON.parse(e.data));
   ws.onclose = () => setTimeout(connect, 1500);
 }
-fetch("/api/graph").then((r) => r.json()).then(applySnapshot);
+fetch("/api/graph").then((r) => r.json()).then((snap) => applyMessage({ type: "snapshot", ...snap }));
 connect();
 
 // Ambient dust (canvas behind the SVG)

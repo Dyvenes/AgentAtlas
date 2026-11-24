@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=41735)
     parser.add_argument("--window", type=float, default=0, help="0 — показывать все узлы; больше 0 — только ресурсы за N секунд")
     parser.add_argument("--stale", type=float, default=60)
-    parser.add_argument("--idle", type=float, default=300)
+    parser.add_argument("--idle", type=float, default=60, help="Секунды после idle до статуса sleeping")
     return parser.parse_args()
 
 
@@ -56,6 +56,18 @@ def resolve_data_dirs(values: list[str]) -> list[Path]:
         result.append(path)
     return result
 
+async def broadcast(payload: dict) -> None:
+    text = json.dumps(payload, ensure_ascii=False)
+    dead = []
+    for ws in connections:
+        try:
+            await ws.send_text(text)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        connections.discard(ws)
+
+
 async def poll(dirs: list[Path]) -> None:
     while True:
         collector.set_paths(discover_jsonl_files(dirs))
@@ -63,25 +75,19 @@ async def poll(dirs: list[Path]) -> None:
         events = collector.drain()
         if events:
             builder.apply(events)
-        await broadcast()
+            # Сначала события — чтобы фронт успел записать pending до snapshot
+            for ev in events:
+                await broadcast({"type": "event", **ev})
+
+        snapshot = builder.snapshot(
+            resource_window=settings["resource_window"],
+            stale_after=settings["stale_after"],
+            idle_after=settings["idle_after"],
+        )
+        snapshot["last_event_id"] = collector.event_counter
+        await broadcast({"type": "snapshot", **snapshot})
         await asyncio.sleep(1)
 
-
-async def broadcast() -> None:
-    snapshot = builder.snapshot(
-        resource_window=settings["resource_window"],
-        stale_after=settings["stale_after"],
-        idle_after=settings["idle_after"],
-    )
-    payload = json.dumps(snapshot, ensure_ascii=False)
-    dead = []
-    for ws in connections:
-        try:
-            await ws.send_text(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        connections.discard(ws)
 
 
 @app.get("/")
@@ -102,11 +108,13 @@ async def graph() -> dict:
 async def ws(socket: WebSocket) -> None:
     await socket.accept()
     connections.add(socket)
-    await socket.send_text(json.dumps(builder.snapshot(
+    snap = builder.snapshot(
         resource_window=settings["resource_window"],
         stale_after=settings["stale_after"],
         idle_after=settings["idle_after"],
-    ), ensure_ascii=False))
+    )
+    snap["last_event_id"] = collector.event_counter
+    await socket.send_text(json.dumps({"type": "snapshot", **snap}, ensure_ascii=False))
     try:
         while True:
             await socket.receive_text()

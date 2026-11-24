@@ -15,6 +15,7 @@ class GraphBuilder:
         self.nodes: dict[str, dict] = {}
         self.edges: dict[tuple[str, str, str], dict] = {}
         self.agent_state: dict[str, dict] = {}
+        self.call_tool: dict[str, str] = {}
 
     def apply(self, events: list[dict]) -> None:
         for item in events:
@@ -57,6 +58,14 @@ class GraphBuilder:
 
             elif kind == "tool.started":
                 self.add_tool(item, agent, at)
+            elif kind == "tool.completed":
+                call_id = str(item.get("call_id") or "")
+                tool_node_id = self.call_tool.get(call_id)
+                if tool_node_id and tool_node_id in self.nodes:
+                    node = self.nodes[tool_node_id]
+                    node["last_completed_at"] = at
+                    if item.get("is_error"):
+                        node["last_is_error"] = True
 
     def agent_node(self, source: str, at: float) -> dict:
         node = self.ensure(f"agent:{source}", "agent", source, {"source": source})
@@ -70,6 +79,9 @@ class GraphBuilder:
         tool = self.ensure(tool_id, "tool", tool_name, {"tool": tool_name})
         tool["last_seen"] = at
         self.link(agent["id"], tool_id, "uses", at)
+        call_id = str(item.get("call_id") or "")
+        if call_id:
+            self.call_tool[call_id] = tool_id
 
         # Файлы создают только реальные write-tools, а не find/read/grep/ls
         if item.get("path") and tool_name in WRITE_TOOLS:

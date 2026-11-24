@@ -37,6 +37,7 @@ class LogCollector:
         self._session_ids: dict[Path, str] = {}
         self.states: dict[Path, FileState] = {}
         self.events: list[dict] = []
+        self._event_counter: int = 0            
         if paths:
             self.set_paths(paths)
 
@@ -47,9 +48,17 @@ class LogCollector:
                 self.states[resolved] = FileState(resolved)
 
     def drain(self) -> list[dict]:
-        out = self.events
+        out = []
+        for ev in self.events:
+            self._event_counter += 1
+            ev["event_id"] = self._event_counter
+            out.append(ev)
         self.events = []
         return out
+
+    @property
+    def event_counter(self) -> int:
+        return self._event_counter
 
     def scan(self, initial: bool = False) -> None:
         for state in self.states.values():
@@ -136,20 +145,29 @@ class LogCollector:
                 stop = msg.get("stopReason")
                 if stop == "toolUse":
                     events.append(self.agent_event("agent.active", at, source, reason="turn_tool_use"))
+                elif stop == "error":
+                    events.append(self.agent_event("agent.error", at, source, reason="stop_error"))
                 elif not stop:
                     events.append(self.agent_event("agent.active", at, source, reason="assistant"))
                 else:
                     events.append(self.agent_event("agent.idle", at, source, reason=f"turn_{stop}"))
-            elif role == "toolResult":
-                if msg.get("isError") is True:
-                    events.append(self.agent_event("agent.error", at, source))
-                else:
-                    events.append(self.agent_event("agent.active", at, source, reason="tool_result"))
-        elif is_tool_result(record):
-            if find_value(record, "isError") is True:
-                events.append(self.agent_event("agent.error", at, source))
+
+        tr = find_tool_result(record)
+        if tr:
+            events.append(self.agent_event(
+                "tool.completed", at, source,
+                call_id=tr["call_id"], is_error=tr["is_error"],
+            ))
+            if tr["is_error"]:
+                events.append(self.agent_event("agent.error", at, source, reason="tool_error"))
             else:
                 events.append(self.agent_event("agent.active", at, source, reason="tool_result"))
+
+        # Codex: turn_aborted — не error, а «ход прерван»
+        if record.get("type") == "event_msg":
+            payload = record.get("payload")
+            if isinstance(payload, dict) and payload.get("type") == "turn_aborted":
+                events.append(self.agent_event("agent.idle", at, source, reason="turn_aborted"))
 
         return events
 
@@ -361,4 +379,28 @@ def find_omp_parent(record: dict, source: Path) -> str | None:
                         return str(obj["id"])
         except OSError:
             continue
+    return None
+
+def find_tool_result(record: dict) -> dict | None:
+    """Return {call_id, is_error} for tool result records (OMP + Codex)."""
+    if not isinstance(record, dict):
+        return None
+    msg = record.get("message") if isinstance(record.get("message"), dict) else None
+    if msg and msg.get("role") == "toolResult":
+        cid = msg.get("toolCallId") or msg.get("tool_call_id")
+        if cid:
+            return {"call_id": str(cid), "is_error": msg.get("isError") is True}
+    if record.get("type") == "response_item":
+        payload = record.get("payload")
+        if isinstance(payload, dict) and payload.get("type") in (
+            "custom_tool_call_output",
+            "function_call_output",
+        ):
+            cid = payload.get("call_id")
+            if cid:
+                is_error = (
+                    payload.get("is_error") is True
+                    or payload.get("status") == "error"
+                )
+                return {"call_id": str(cid), "is_error": is_error}
     return None

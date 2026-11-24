@@ -45,6 +45,28 @@
   #scene .node.status-ended { opacity: 0.35; }
   #scene .node.status-error .aura { fill: var(--error); opacity: 0.7; }
   #scene .node.status-error { animation: error-shake 450ms ease-out 1; }
+    /* 7 visual states — Stage 1.4 (базовая версия; полная анимация в Stage 5) */
+  #scene .node[data-state="Idle"] .drift { animation: drift var(--dur, 7s) ease-in-out infinite; opacity: 1; }
+  #scene .node[data-state="Waiting"] .drift { animation: drift var(--dur, 9s) ease-in-out infinite; opacity: 0.85; }
+  #scene .node[data-state="Calling-tool"] .drift { animation: aura-pulse 1.2s ease-in-out infinite; }
+  #scene .node[data-state="Delegating"] .drift { animation: drift 4s ease-in-out infinite; }
+  #scene .node[data-state="Sleeping"] .drift { animation: none; opacity: 0.35; transform: translateY(-6px) scale(0.92); }
+  #scene .node[data-state="Completed"] .drift { animation: none; opacity: 0.25; transform: scale(0.85); }
+  #scene .node[data-state="Error"] .drift { animation: error-shake 450ms ease-out 1; }
+
+  #scene .orbit-satellite[data-state="Completed"] circle { fill: var(--violet); opacity: 0.35; }
+  #scene .orbit-satellite[data-state="Sleeping"] circle { opacity: 0.3; }
+  #scene .orbit-satellite[data-state="Error"] circle { fill: var(--error); opacity: 0.9; }
+  #scene .orbit-satellite[data-state="Calling-tool"] circle { animation: aura-pulse 1.2s ease-in-out infinite; }  
+
+  #scene .completion-particle {
+    pointer-events: none;
+    filter: url(#impulseGlow);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #scene .node[data-state] .drift { animation: none !important; }
+  }
   #scene .node.stale { opacity: 0.65; }
   @keyframes aura-pulse {
     0%, 100% { opacity: 0.25; transform: scale(1); }

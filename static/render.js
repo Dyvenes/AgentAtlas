@@ -1,5 +1,6 @@
 import { truncateLabel, isCollapsed, orbitPosition } from "./model.js";
 import { hash32 } from "./layout.js";
+import { route } from "./edge_router.js";
 
 const NS = "http://www.w3.org/2000/svg";
 
@@ -94,6 +95,12 @@ function edgePath(a, b) {
   return `M${a.x},${a.y} C${c1x},${c1y} ${c2x},${c2y} ${b.x},${b.y}`;
 }
 
+function getTranslate(el) {
+  const t = el.getAttribute?.("transform") || "";
+  const m = t.match(/translate\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)/);
+  return m ? { x: parseFloat(m[1]), y: parseFloat(m[2]) } : null;
+}
+
 export function buildDefs(svg) {
   const defs = el("defs");
   defs.append(el("radialGradient", { id: "agentAura" }, [
@@ -135,7 +142,8 @@ export class SceneRenderer {
     this.edgeLayer = el("g", { class: "edges" });
     this.impulseLayer = el("g", { class: "impulses" });
     this.nodeLayer = el("g", { class: "nodes" });
-    svg.append(this.islandLayer, this.cloudLayer, this.edgeLayer, this.impulseLayer, this.nodeLayer);
+    this.completionLayer = el("g", { class: "completions", "pointer-events": "none" });
+    svg.append(this.islandLayer, this.cloudLayer, this.edgeLayer, this.impulseLayer, this.nodeLayer, this.completionLayer);
     this.topologyKey = "";
     this.nodeEls = new Map();
     this.edgeEls = new Map();
@@ -155,10 +163,11 @@ export class SceneRenderer {
     this.edgeLayer.setAttribute("transform", t);
     this.impulseLayer.setAttribute("transform", t);
     this.nodeLayer.setAttribute("transform", t);
+    this.completionLayer.setAttribute("transform", t);
   }
 
   update(snapshot, positions, opts = {}) {
-    const { expandedSet = new Set(), reducedMotion = false, onSelect } = opts;
+    const { expandedSet = new Set(), reducedMotion = false, onSelect, states = new Map(), removed = new Set() } = opts;
     this.positions = positions;
 
     const MAX_FILES = 400;
@@ -185,6 +194,15 @@ export class SceneRenderer {
     }
 
     const byId = new Map(nodes.map((n) => [n.id, n]));
+
+    const obstacles = nodes
+      .filter((n) => n.type === "project")
+      .map((n) => {
+        const p = positions.get(n.id);
+        return p ? { x: p.x, y: p.y, r: p.r || 52 } : null;
+      })
+      .filter(Boolean);
+    this._obstacles = obstacles;
 
     const cmap = new Map();
     for (const e of edges) {
@@ -233,7 +251,7 @@ export class SceneRenderer {
     }
 
     // Topology key: node ids + edge triples
-    const key = nodes.map((n) => n.id).join("|") + "#" + edges.map((e) => `${e.source}>${e.target}:${e.relation}`).join("|") + "@" + [...expandedSet].sort().join(",");
+    const key = nodes.map((n) => n.id).join("|") + "#" + edges.map((e) => `${e.source}>${e.target}:${e.relation}`).join("|") + "@" + [...expandedSet].sort().join(",") + "!" + [...removed].sort().join(",");
 
     // Сброс импульсов, если изменился reducedMotion
     if (this.reducedMotion !== reducedMotion) {
@@ -245,14 +263,14 @@ export class SceneRenderer {
 
     if (key !== this.topologyKey) {
       this.topologyKey = key;
-      this._rebuild(nodes, edges, byId, positions, orbitFor, hidden, onSelect);
+      this._rebuild(nodes, edges, byId, positions, orbitFor, hidden, onSelect, states, removed, obstacles);
     } else {
-      this._updateStates(nodes, orbitFor, hidden);
+      this._updateStates(nodes, orbitFor, hidden, states);
     }
     this._updateImpulses(nodes, edges);
   }
 
-  _rebuild(nodes, edges, byId, positions, orbitFor, hidden, onSelect) {
+  _rebuild(nodes, edges, byId, positions, orbitFor, hidden, onSelect, states = new Map(), removed = new Set(), obstacles = []) {
     this.stopOrbitAnimation();
     this._orbitState.clear();    
     this.impulseLayer.replaceChildren();
@@ -296,9 +314,11 @@ export class SceneRenderer {
     // Edges
     // Edges — collapsed children re-anchor to their orbit position
     // Edges — collapsed children re-anchor to their orbit position
+    const pairCounts = new Map();    
     for (const e of edges) {
       let a = positions.get(e.source);
       let b = positions.get(e.target);
+      
       if (!b && orbitFor.has(e.target) && positions.has(e.source)) {
         b = orbitFor.get(e.target);
       }
@@ -309,9 +329,16 @@ export class SceneRenderer {
       const srcHidden = hidden.has(e.source) && !orbitFor.has(e.source);
       const dstHidden = hidden.has(e.target) && !orbitFor.has(e.target);
       if (srcHidden || dstHidden) continue;
+      if (removed.has(e.source) || removed.has(e.target)) continue;
       const isSpawn = e.relation === "spawns";
+
+      const pairKey = `${e.source}>${e.target}`;
+      const parallelIndex = pairCounts.get(pairKey) || 0;
+      pairCounts.set(pairKey, parallelIndex + 1);
+
+      const routed = route(a, b, obstacles, parallelIndex);
       const path = el("path", {
-        d: edgePath(a, b),
+        d: routed.d,
         class: `edge ${e.relation}${isSpawn && orbitFor.has(e.target) ? " spawns-collapsed" : ""}`,
         "data-source": e.source,
         "data-target": e.target,
@@ -322,11 +349,13 @@ export class SceneRenderer {
 
     // Nodes
     for (const n of nodes) {
-      if (hidden.has(n.id)) continue;
+      if (hidden.has(n.id) || removed.has(n.id)) continue;
       const p = positions.get(n.id);
       if (!p) continue;
-            const g = el("g", {
+      const resolved = states.get(n.id)?.state;
+      const g = el("g", {
         class: `node type-${n.type} status-${n.status || "unknown"}${n.stale ? " stale" : ""}`,
+        "data-state": resolved || (n.type === "agent" ? "Idle" : ""),
         transform: `translate(${p.x},${p.y})`,
         tabindex: 0,
         role: "button",
@@ -377,8 +406,10 @@ export class SceneRenderer {
     this._orbitState.clear();
     for (const [childId, orbit] of orbitFor) {
       if (!orbit) continue;
+      if (removed.has(childId)) continue;
       const child = byId.get(childId);
-      if (!child) continue;
+      const childState = states.get(childId)?.state;
+
       const parentEdge = edges.find((e) => e.target === childId && e.relation === "spawns");
       if (!parentEdge) continue;
       let idx = 0;
@@ -389,6 +420,7 @@ export class SceneRenderer {
       }
       const g = el("g", {
         class: `orbit-satellite status-${child.status}`,
+        "data-state": childState || "",
         transform: `translate(${orbit.x},${orbit.y})`,
         "data-orbit": childId,
         tabindex: 0,
@@ -419,15 +451,22 @@ export class SceneRenderer {
     return g;
   }
 
-  _updateStates(nodes, orbitFor, hidden) {
+  _updateStates(nodes, orbitFor, hidden, states = new Map()) {
     for (const n of nodes) {
       const g = this.nodeEls.get(n.id);
       if (!g) continue;
       g.classList.remove("status-active", "status-idle", "status-sleeping", "status-ended", "status-error", "status-unknown");
       g.classList.add(`status-${n.status || "unknown"}`);
       g.classList.toggle("stale", Boolean(n.stale));
+      const resolved = states.get(n.id)?.state;
+      if (resolved) g.setAttribute("data-state", resolved);
       const badge = g.querySelector(".stale-badge");
       if (badge) badge.textContent = n.stale ? "?" : "";
+    }
+    for (const [childId] of orbitFor) {
+      const sat = this.nodeLayer.querySelector(`[data-orbit="${CSS.escape(childId)}"]`);
+      const resolved = states.get(childId)?.state;
+      if (sat && resolved) sat.setAttribute("data-state", resolved);
     }
   }
 
@@ -581,9 +620,56 @@ export class SceneRenderer {
       const edge = this.edgeEls.get(edgeKey);
       if (edge) {
         const a = this.positions.get(state.parentId);
-        if (a) edge.setAttribute("d", edgePath(a, p));
+        if (a) edge.setAttribute("d", route(a, p, this._obstacles || []).d);
       }
     }
+  }
+
+  playCompletion(childId, parentId, onDone) {
+    if (this.reducedMotion) {
+      if (onDone) onDone();
+      return;
+    }
+    const childEl = this.nodeEls.get(childId)
+      || this.nodeLayer.querySelector(`[data-orbit="${CSS.escape(childId)}"]`);
+    const start = childEl ? getTranslate(childEl) : null;
+    const parentPos = this.positions.get(parentId);
+    if (!start || !parentPos) {
+      if (onDone) onDone();
+      return;
+    }
+    const end = parentPos;
+    const path = `M${start.x},${start.y} L${end.x},${end.y}`;
+
+    const N = 6;
+    const particles = [];
+    for (let i = 0; i < N; i++) {
+      const c = el("circle", {
+        r: 4,
+        fill: "#52E6FF",
+        class: "completion-particle",
+      });
+      const begin = `${(i * 0.03).toFixed(2)}s`;
+      c.append(el("animateMotion", {
+        path, dur: "0.6s", begin, fill: "remove",
+      }));
+      c.append(el("animate", {
+        attributeName: "opacity",
+        from: "1", to: "0", dur: "0.6s", begin, fill: "remove",
+      }));
+      this.completionLayer.append(c);
+      particles.push(c);
+    }
+
+    if (childEl) {
+      childEl.style.transition = "opacity 400ms ease-out";
+      childEl.style.opacity = "0";
+    }
+
+    setTimeout(() => {
+      for (const p of particles) p.remove();
+      if (onDone) onDone();
+    }, 650);
   }
 
   toggleEdgeActive(sourceId, targetId, active) {

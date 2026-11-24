@@ -104,3 +104,40 @@ test("hash32 is stable", () => {
   assert.equal(hash32("agent:1"), hash32("agent:1"));
   assert.notEqual(hash32("agent:1"), hash32("agent:2"));
 });
+
+
+test("adding a project does not move existing nodes", () => {
+  const nodes = [
+    { id: "project:a", type: "project", label: "A" },
+    { id: "project:b", type: "project", label: "B" },
+    { id: "file:a1", type: "file", label: "f1.txt" },
+  ];
+  const edges = [{ source: "project:a", target: "file:a1", relation: "contains" }];
+  const prev = layoutScene(nodes, edges, new Map(), new Set());
+
+  const next = [...nodes, { id: "project:c", type: "project", label: "C" }];
+  const out = layoutScene(next, edges, prev, new Set());
+
+  for (const [id, p] of prev) {
+    const q = out.get(id);
+    assert.equal(q.x, p.x, `${id}.x moved`);
+    assert.equal(q.y, p.y, `${id}.y moved`);
+  }
+  // новый проект получил валидную позицию
+  const c = out.get("project:c");
+  assert.ok(c && Number.isFinite(c.x) && Number.isFinite(c.y));
+});
+
+test("project cells are stable across runs (sorted by id)", () => {
+  const nodes = [
+    { id: "project:z", type: "project", label: "Z" },
+    { id: "project:a", type: "project", label: "A" },
+    { id: "project:m", type: "project", label: "M" },
+  ];
+  const a = layoutScene(nodes, [], new Map(), new Set());
+  const b = layoutScene(nodes, [], new Map(), new Set());
+  for (const id of ["project:z", "project:a", "project:m"]) {
+    assert.equal(a.get(id).x, b.get(id).x);
+    assert.equal(a.get(id).y, b.get(id).y);
+  }
+});

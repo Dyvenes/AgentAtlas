@@ -185,17 +185,30 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
       }
     }
 
-    // Сетка проектов (а не спираль) — чёткая визуальная группировка
-    const cols = Math.min(4, Math.max(1, projects.length));
+    // Стабильная сетка: cols фиксирован, проекты занимают ячейки по порядку id.
+    // При добавлении/удалении проекта существующие НЕ сдвигаются.
+    const cols = 4;
     const cellW = 300;
     const cellH = 500;
     const gridStartX = 500 - ((cols - 1) * cellW) / 2;
+    const gridStartY = ZONE.projects;
 
-    projects.forEach((p, i) => {
-      const col = i % cols;
-      const row = Math.floor(i / cols);
+    const occupied = new Set();
+    const projectCells = new Map();
+    projects.forEach((p) => {
+      let col = 0, row = 0;
+      while (occupied.has(`${col},${row}`)) {
+        col++;
+        if (col >= cols) { col = 0; row++; }
+      }
+      occupied.add(`${col},${row}`);
+      projectCells.set(p.id, { col, row });
+    });
+
+    projects.forEach((p) => {
+      const { col, row } = projectCells.get(p.id);
       const cx = gridStartX + col * cellW + jitter(p.id, 30);
-      const cy = ZONE.projects + row * cellH + jitter(p.id, 30);
+      const cy = gridStartY + row * cellH + jitter(p.id, 30);
 
       pos.set(p.id, { x: cx, y: cy, r: 52 });
 
@@ -278,7 +291,8 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
       });
     });
 
-    resolveCollisions(pos, pinned);
+    const projectsPinned = new Set([...pinned, ...projects.map((p) => p.id)]);
+    resolveCollisions(pos, projectsPinned);
     return pos;
   }
 
@@ -287,6 +301,40 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
     if (byId.has(id)) pos.set(id, { ...p });
   }
   const fresh = [];
+
+  // Стабильная сетка — те же константы, что в полной ветке
+  const cols = 4;
+  const cellW = 300;
+  const cellH = 500;
+  const gridStartX = 500 - ((cols - 1) * cellW) / 2;
+  const gridStartY = ZONE.projects;
+
+  // Определяем занятые ячейки по существующим проектам
+  const occupied = new Set();
+  for (const p of projects) {
+    const prev = previous.get(p.id);
+    if (!prev) continue;
+    const col = Math.round((prev.x - gridStartX) / cellW);
+    const row = Math.round((prev.y - gridStartY) / cellH);
+    occupied.add(`${col},${row}`);
+  }
+
+  // Фаза A: проекты — существующие из previous, новые в свободную ячейку
+  for (const p of projects) {
+    if (pos.has(p.id)) continue;
+    let col = 0, row = 0;
+    while (occupied.has(`${col},${row}`)) {
+      col++;
+      if (col >= cols) { col = 0; row++; }
+    }
+    occupied.add(`${col},${row}`);
+    const x = gridStartX + col * cellW + jitter(p.id, 30);
+    const y = gridStartY + row * cellH + jitter(p.id, 30);
+    pos.set(p.id, { x, y, r: 52 });
+    fresh.push(p.id);
+  }
+
+  // Фаза B: остальные узлы
   for (const n of nodes) {
     if (pos.has(n.id)) continue;
     const parent = parentOf.get(n.id);
@@ -307,23 +355,21 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
       x = 500 + jitter(n.id, 300);
       y = ZONE.sites + jitter(n.id, 20);
       r = 24;
-    } else if (n.type === "project") {
-      x = 500 + jitter(n.id, 220);
-      y = ZONE.projects + jitter(n.id, 120);
-      r = 52;
     } else {
+      // Папки/файлы/тулы без проекта — в orphans-зону
       x = 500 + jitter(n.id, 260);
       y = ZONE.projects + 120 + jitter(n.id, 160);
       r = 18;
     }
-    const point = { x, y, r };
-    pos.set(n.id, point);
+    pos.set(n.id, { x, y, r });
     fresh.push(n.id);
   }
   // Коллизия только для новых (не двигаем существующие).
   for (let iter = 0; iter < 60; iter++) {
     let moved = false;
     for (const fid of fresh) {
+      if (pinned.has(fid)) continue;
+      if (fid.startsWith("project:")) continue;   // ← здесь fid ОК
       const a = pos.get(fid);
       for (const [oid, b] of pos) {
         if (oid === fid) continue;
