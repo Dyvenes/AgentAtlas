@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,9 +38,15 @@ class LogCollector:
         self._session_ids: dict[Path, str] = {}
         self.states: dict[Path, FileState] = {}
         self.events: list[dict] = []
-        self._event_counter: int = 0            
+        self._event_counter: int = 0
+        self._started_calls: dict[str, None] = {}  # упорядоченный набор для дедупликации
         if paths:
             self.set_paths(paths)
+
+    def _remember_call(self, call_id: str) -> None:
+        self._started_calls[call_id] = None
+        while len(self._started_calls) > 5000:
+            self._started_calls.pop(next(iter(self._started_calls)))
 
     def set_paths(self, paths: list[Path]) -> None:
         for path in paths:
@@ -61,6 +68,7 @@ class LogCollector:
         return self._event_counter
 
     def scan(self, initial: bool = False) -> None:
+        now = time.time()
         for state in self.states.values():
             try:
                 stat = state.path.stat()
@@ -72,28 +80,32 @@ class LogCollector:
             state.identity = identity
             if stat.st_size < state.offset:
                 state.offset = 0
-            with state.path.open("r", encoding="utf-8", errors="replace") as fh:
+            if stat.st_size == state.offset:
+                continue
+            # Бинарный режим: offset — это реальные байты, без перевода \r\n в \n.
+            with state.path.open("rb") as fh:
                 fh.seek(state.offset)
                 while True:
-                    line = fh.readline()
-                    if not line:
+                    raw = fh.readline()
+                    if not raw:
                         break
-                    state.offset += len(line.encode("utf-8", errors="replace"))
-                    if self._parse(line) is not None:
-                        pass  # parse уже будет вызван ниже                    
-                    record = self._parse(line)
-                    if record:
-                        # Pre-register session ids so agent.parent and agent events share canonical id.
-                        if isinstance(record, dict):
-                            if record.get("type") == "session" and record.get("id"):
-                                self._session_ids[state.path] = str(record["id"])
-                            elif record.get("type") == "session_meta":
-                                payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-                                sid = payload.get("id")
-                                if sid:
-                                    self._session_ids[state.path] = str(sid)
-                        at = extract_timestamp(record) or now
-                        self.events.extend(self._events(record, state.path, at))
+                    record = self._parse(raw.decode("utf-8", errors="replace"))
+                    if not raw.endswith(b"\n") and record is None:
+                        # Писатель ещё не дописал строку: оставляем её на следующий проход.
+                        break
+                    state.offset += len(raw)
+                    if not record:
+                        continue
+                    # Pre-register session ids so agent.parent and agent events share canonical id.
+                    if record.get("type") == "session" and record.get("id"):
+                        self._session_ids[state.path] = str(record["id"])
+                    elif record.get("type") == "session_meta":
+                        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+                        sid = payload.get("id")
+                        if sid:
+                            self._session_ids[state.path] = str(sid)
+                    at = extract_timestamp(record) or now
+                    self.events.extend(self._events(record, state.path, at))
 
     @staticmethod
     def _parse(line: str) -> dict | None:
@@ -125,13 +137,16 @@ class LogCollector:
         if parent_id and parent_id != canonical:
             events.append(self.agent_event("agent.parent", at, source, parent_agent_id=parent_id))
 
-        if find_payload_type(record) == "taskstarted" or find_value(record, "type") == "taskstarted":
+        turn_marker = _norm_type(find_payload_type(record)) or _norm_type(record.get("type"))
+        if turn_marker in {"taskstarted", "turnstarted"}:
             events.append(self.agent_event("agent.active", at, source, reason="turn_started"))
-        if find_payload_type(record) == "taskcomplete" or find_value(record, "type") == "taskcomplete":
+        elif turn_marker in {"taskcomplete", "turncomplete"}:
             events.append(self.agent_event("agent.idle", at, source, reason="turn_complete"))
 
-        tool = find_tool_call(record)
-        if tool:
+        for tool in find_tool_calls(record):
+            if tool["call_id"] in self._started_calls:
+                continue  # toolCall и tool_execution_start описывают один и тот же вызов
+            self._remember_call(tool["call_id"])
             events.append(self.agent_event("tool.started", at, source, tool=tool["name"], call_id=tool["call_id"], **tool["target"]))
             events.append(self.agent_event("agent.active", at, source, reason="tool_call"))
 
@@ -178,6 +193,10 @@ class LogCollector:
     def agent_event(self, kind: str, at: float, source: Path, **data: Any) -> dict:
         canonical = self._session_ids.get(source) or source.stem
         return {"kind": kind, "at": at, "source": canonical, **{k: v for k, v in data.items() if v not in (None, "")}}
+
+
+def _norm_type(value: Any) -> str:
+    return str(value).replace("_", "").replace("-", "").lower() if isinstance(value, str) else ""
 
 
 def extract_timestamp(record: Any) -> float | None:
@@ -250,15 +269,26 @@ def find_key(value: Any, keys: set[str]) -> Any:
                 return found
     return None
 
-def find_tool_call(value: Any) -> dict | None:
+_TOOL_CALL_TYPES = {"toolCall", "function_call", "custom_tool_call"}
+
+
+def find_tool_calls(value: Any) -> list[dict]:
+    """Все вызовы инструментов в записи (OMP может положить несколько toolCall в один content[])."""
+    found: list[dict] = []
+    _collect_tool_calls(value, found)
+    return found
+
+
+def _collect_tool_calls(value: Any, out: list[dict]) -> None:
     if isinstance(value, dict):
-        if value.get("type") in ("toolCall", "function_call") or value.get("customType") == "tool_execution_start":
+        if value.get("type") in _TOOL_CALL_TYPES or value.get("customType") == "tool_execution_start":
             name = value.get("name") or value.get("toolName")
+            # Для Codex call_id совпадает с *_output.call_id, а `id` — другой идентификатор.
             call_id = (
-                value.get("id")
-                or value.get("toolCallId")
+                value.get("call_id")
                 or value.get("callid")
-                or value.get("call_id")
+                or value.get("toolCallId")
+                or value.get("id")
             )
             target = extract_target(value)
             data = value.get("data")
@@ -268,29 +298,52 @@ def find_tool_call(value: Any) -> dict | None:
                 if not (target.get("path") or target.get("url") or target.get("command")):
                     target = extract_target(data)
             if name:
-                return {"name": str(name), "call_id": str(call_id or name), "target": target}
+                out.append({"name": str(name), "call_id": str(call_id or name), "target": target})
+                return  # внутрь найденного вызова не спускаемся
         for item in value.values():
-            found = find_tool_call(item)
-            if found:
-                return found
+            _collect_tool_calls(item, out)
     elif isinstance(value, list):
         for item in value:
-            found = find_tool_call(item)
-            if found:
-                return found
-    return None
+            _collect_tool_calls(item, out)
+
+
+def find_tool_call(value: Any) -> dict | None:
+    """Обратная совместимость: первый вызов в записи."""
+    calls = find_tool_calls(value)
+    return calls[0] if calls else None
+
+
+_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$", re.MULTILINE)
+_PATCH_MOVE_RE = re.compile(r"^\*\*\* Move to: (.+?)\s*$", re.MULTILINE)
+
+
+def extract_patch_paths(text: Any) -> list[str]:
+    """Пути из тела Codex apply_patch ("*** Update File: ...")."""
+    if not isinstance(text, str):
+        return []
+    paths = _PATCH_FILE_RE.findall(text) + _PATCH_MOVE_RE.findall(text)
+    return list(dict.fromkeys(p.strip() for p in paths if p.strip()))
+
 
 def extract_target(value: Any) -> dict:
     args = value.get("arguments") or value.get("input") or value.get("args")
+    patch_paths: list[str] = []
     if isinstance(args, str):
+        patch_paths = extract_patch_paths(args)
         try:
             args = json.loads(args)
         except json.JSONDecodeError:
             args = {}
     if not isinstance(args, dict):
         args = {}
+    path = args.get("path") or args.get("file_path") or args.get("filePath")
+    if not patch_paths:
+        patch_paths = extract_patch_paths(args.get("input") or args.get("patch"))
+    if not path and patch_paths:
+        path = patch_paths[0]
     return {
-        "path": args.get("path") or args.get("file_path") or args.get("filePath"),
+        "path": path,
+        "paths": patch_paths if len(patch_paths) > 1 else None,
         "url": args.get("url") or args.get("uri"),
         "command": args.get("command"),
     }

@@ -1,4 +1,4 @@
-import { truncateLabel, isCollapsed, orbitPosition } from "./model.js";
+import { truncateLabel, isCollapsed, orbitPosition, computeActiveEdgeKeys } from "./model.js";
 import { hash32 } from "./layout.js";
 import { route } from "./edge_router.js";
 
@@ -187,7 +187,7 @@ export class SceneRenderer {
 
     let edges = snapshot.edges.filter((e) => keepIds.has(e.source) && keepIds.has(e.target));
     if (edges.length > MAX_EDGES) {
-      const priority = { spawns: 0, contains: 1, uses: 2, writes: 3, requests: 4 };
+      const priority = { spawns: 0, works_in: 1, contains: 2, uses: 3, writes: 4, requests: 5 };
       edges = [...edges]
         .sort((a, b) => (priority[a.relation] ?? 9) - (priority[b.relation] ?? 9))
         .slice(0, MAX_EDGES);
@@ -305,11 +305,10 @@ export class SceneRenderer {
 
 
 
-    // Clouds: internet / lan / localhost — рисуем только если есть соответствующие сайты
-    const scopes = new Set(nodes.filter((n) => n.type === "site").map((n) => n.scope || "internet"));
-    if (scopes.has("internet")) this.cloudLayer.append(this._cloud(500, 150, 460, 110, "#52E6FF"));
-    if (scopes.has("lan")) this.cloudLayer.append(this._cloud(500, 480, 320, 80, "#9F8BFF"));
-    if (scopes.has("localhost")) this.cloudLayer.append(this._cloud(500, 640, 280, 70, "#FF67D8"));
+    // Clouds: internet / lan / localhost — постоянные зоны (§3.3), видны даже без серверов
+    this.cloudLayer.append(this._cloud(500, 150, 460, 110, "#52E6FF"));
+    this.cloudLayer.append(this._cloud(500, 480, 320, 80, "#9F8BFF"));
+    this.cloudLayer.append(this._cloud(500, 640, 280, 70, "#FF67D8"));
 
     // Edges
     // Edges — collapsed children re-anchor to their orbit position
@@ -471,21 +470,10 @@ export class SceneRenderer {
   }
 
   _updateImpulses(nodes, edges) {
-    // --- Найти активные рёбра ---
-    const activeAgents = new Set();
-    for (const n of nodes) {
-      if (n.type === "agent" && n.status === "active") activeAgents.add(n.id);
-    }
-    const hotTools = new Set();
-    for (const e of edges) {
-      if (e.relation === "uses" && activeAgents.has(e.source)) hotTools.add(e.target);
-    }
-    const isActiveEdge = (e) => activeAgents.has(e.source) || hotTools.has(e.source);
-
+    // --- Найти активные рёбра: только по реальным незавершённым вызовам ---
+    const activeKeys = computeActiveEdgeKeys(nodes, edges);
     const newActiveKeys = new Set();
-    for (const e of edges) {
-      if (!isActiveEdge(e)) continue;
-      const key = `${e.source}>${e.target}:${e.relation}`;
+    for (const key of activeKeys) {
       if (this.edgeEls.has(key)) newActiveKeys.add(key);
     }
 
@@ -537,29 +525,11 @@ export class SceneRenderer {
     const projects = nodes.filter((n) => n.type === "project");
     if (projects.length === 0) return;
 
-    // memberCount: папки и файлы проекта + агенты через uses→tool→writes
+    // memberCount: папки, файлы и агенты проекта (у всех есть project_id)
     const memberCount = new Map();
     for (const n of nodes) {
       const pid = n.project_id;
       if (pid) memberCount.set(pid, (memberCount.get(pid) || 0) + 1);
-    }
-
-    const toolProjects = new Map();
-    for (const e of edges) {
-      if (e.relation !== "writes") continue;
-      const file = byId.get(e.target);
-      const pid = file?.project_id;
-      if (!pid) continue;
-      if (!toolProjects.has(e.source)) toolProjects.set(e.source, new Set());
-      toolProjects.get(e.source).add(pid);
-    }
-    for (const e of edges) {
-      if (e.relation !== "uses") continue;
-      const toolProjSet = toolProjects.get(e.target);
-      if (!toolProjSet) continue;
-      for (const pid of toolProjSet) {
-        memberCount.set(pid, (memberCount.get(pid) || 0) + 1);
-      }
     }
 
     for (const p of projects) {
@@ -567,9 +537,7 @@ export class SceneRenderer {
       if (!pos) continue;
       const count = Math.max(1, memberCount.get(p.id) || 0);
       const R = 60 + 14 * Math.sqrt(count);
-      const variant = (hash32(p.id) % 2) === 0
-        ? "crystal_floating_platform"
-        : "neon_crystal_platform";
+      const variant = "crystal_floating_platform";
       const w = R * 3.2;
       const h = R * 1.2;
       this.islandLayer.append(el("image", {

@@ -92,27 +92,39 @@ function applySnapshot(snap) {
 }
 
 function trackEvent(ev) {
+  // Ключ — id узла агента ("agent:<session id>"), как его ищет resolveStates.
+  const agentId = `agent:${ev.source}`;
   if (ev.kind === "tool.started" && ev.call_id) {
-    if (!pendingByAgent.has(ev.source)) pendingByAgent.set(ev.source, new Set());
-    pendingByAgent.get(ev.source).add(ev.call_id);
+    if (!pendingByAgent.has(agentId)) pendingByAgent.set(agentId, new Set());
+    pendingByAgent.get(agentId).add(ev.call_id);
   } else if (ev.kind === "tool.completed" && ev.call_id) {
-    const s = pendingByAgent.get(ev.source);
-    if (s) {
-      s.delete(ev.call_id);
-      if (s.size === 0) pendingByAgent.delete(ev.source);
+    const set = pendingByAgent.get(agentId);
+    if (set) {
+      set.delete(ev.call_id);
+      if (set.size === 0) pendingByAgent.delete(agentId);
     }
+  } else if (ev.kind === "agent.idle" || (ev.kind === "agent.error" && ev.reason !== "tool_error")) {
+    pendingByAgent.delete(agentId);   // ход закончился: незавершённых вызовов не осталось
   }
 }
 
 function reapplyStatesOnly() {
   const states = resolveStates(snapshot, { now: Date.now(), pendingByAgent });
 
+  // Потомок, который снова ожил, возвращается на сцену.
+  for (const id of [...removedSet]) {
+    const s = states.get(id)?.state;
+    if (s && s !== "Completed") removedSet.delete(id);
+  }
+
   for (const [id, info] of states) {
-    if (info.state !== "Completed") continue;
-    if (prevStates.get(id)?.state === "Completed") continue;
-    if (removedSet.has(id)) continue;
+    if (info.state !== "Completed" || removedSet.has(id)) continue;
+    const before = prevStates.get(id)?.state;
+    // Впервые увидели уже завершённым (история, новая вкладка): убираем молча, без анимации.
+    if (before === undefined) { removedSet.add(id); continue; }
+    if (before === "Completed") continue;   // анимация уже идёт
     const parentEdge = snapshot.edges.find((e) => e.target === id && e.relation === "spawns");
-    if (!parentEdge) continue;
+    if (!parentEdge) { removedSet.add(id); continue; }
     renderer.playCompletion(id, parentEdge.source, () => {
       removedSet.add(id);
       reapplyStatesOnly();
@@ -187,6 +199,11 @@ function refreshCard() {
   ];
   if (node.type === "agent" && (node.model || node.provider)) {
     lines.push(`<span class="muted">${escapeHtml(node.provider || "")} ${escapeHtml(node.model || "")}</span>`);
+  }
+  if (node.type === "agent") {
+    const state = prevStates.get(node.id)?.state;
+    if (state) lines.push(`<span class="muted">Состояние: ${escapeHtml(state)}</span>`);
+    if (node.cwd) lines.push(`<span class="muted">Папка: ${escapeHtml(node.cwd)}</span>`);
   }
   if (node.type === "file" && node.extension) lines.push(`<span class="muted">${escapeHtml(node.extension)}</span>`);
   if (total > 0) lines.push(`<span class="muted">Дочерние агенты: ${total} (${active} активных)</span>`);
@@ -323,7 +340,7 @@ searchInput.addEventListener("input", (e) => {
   }
   searchMatches = new Set();
   for (const n of snapshot.nodes) {
-    const hay = [(n.label || ""), (n.id || ""), (n.provider || ""), (n.model || "")].join(" ").toLowerCase();
+    const hay = [(n.label || ""), (n.id || ""), (n.provider || ""), (n.model || ""), (n.cwd || "")].join(" ").toLowerCase();
     if (hay.includes(q)) searchMatches.add(n.id);
   }
   applySearchHighlight();
@@ -392,6 +409,10 @@ function connect() {
   const ws = new WebSocket(`ws://${location.host}/ws`);
   ws.onopen = () => {
     pendingByAgent.clear();
+    // Просим сервер повторить события, пропущенные за время разрыва (буфер на сервере — 2000).
+    if (eventQueue.lastId > 0) {
+      ws.send(JSON.stringify({ type: "resume", since: eventQueue.lastId }));
+    }
   };
   ws.onmessage = (e) => applyMessage(JSON.parse(e.data));
   ws.onclose = () => setTimeout(connect, 1500);

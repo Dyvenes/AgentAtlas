@@ -1,4 +1,10 @@
+// Завершённый потомок теперь исчезает через 5 с (state_resolver: Completed → playCompletion).
+// Сворачивание в «спутник» в эти 5 с давало лишь мерцание, поэтому по умолчанию выключено.
+// Чтобы вернуть орбиты, поставьте true.
+export const COLLAPSE_CHILDREN = false;
+
 export function isCollapsed(child, parentInScene, expandedSet) {
+  if (!COLLAPSE_CHILDREN) return false;
   if (!parentInScene) return false;
   if (child.stale) return false;
   if (child.lifecycle_known !== true) return false;
@@ -58,4 +64,27 @@ export function activeDescendantCount(id, cmap, statusMap) {
 export function truncateLabel(label, max = 22) {
   const s = String(label ?? "");
   return [...s].length <= max ? s : [...s].slice(0, max).join("") + "…";
+}
+/**
+ * Рёбра, по которым сейчас идёт передача (§7): только пока вызов инструмента не завершён.
+ *  uses            агент → инструмент      — у инструмента есть незавершённый вызов
+ *  writes/requests инструмент → цель       — то же
+ *  spawns          родитель → потомок      — потомок активен
+ * Структурные связи (works_in, contains) никогда не «пульсируют».
+ * @returns {Set<string>} ключи вида "source>target:relation"
+ */
+export function computeActiveEdgeKeys(nodes, edges) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const hotTools = new Set(
+    nodes.filter((n) => n.type === "tool" && n.pending_calls > 0).map((n) => n.id),
+  );
+  const keys = new Set();
+  for (const e of edges) {
+    let active = false;
+    if (e.relation === "uses") active = hotTools.has(e.target);
+    else if (e.relation === "writes" || e.relation === "requests") active = hotTools.has(e.source);
+    else if (e.relation === "spawns") active = byId.get(e.target)?.status === "active";
+    if (active) keys.add(`${e.source}>${e.target}:${e.relation}`);
+  }
+  return keys;
 }

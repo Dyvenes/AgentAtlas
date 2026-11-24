@@ -93,6 +93,9 @@ export function route(a, b, obstacles = [], parallelIndex = 0) {
   let blockerDist = Infinity;
   for (const o of obstacles) {
     if (!o || o.r == null) continue;
+    // Ребро, начинающееся или заканчивающееся в самом препятствии (агент → проект,
+    // проект → папка), не должно огибать собственный конец.
+    if (Math.hypot(o.x - a.x, o.y - a.y) <= o.r || Math.hypot(o.x - b.x, o.y - b.y) <= o.r) continue;
     const d = pointSegmentDistance(o.x, o.y, a.x, a.y, b.x, b.y);
     const threshold = (o.r || 0) + MARGIN;
     if (d < threshold && d < blockerDist) {

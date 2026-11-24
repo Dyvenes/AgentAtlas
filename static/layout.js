@@ -107,9 +107,8 @@ function walkUpToProject(startId, byId, parentOf) {
     const node = byId.get(cur);
     if (!node) return null;
     if (node.type === "project") return node;
-    if (node.data?.project_id && byId.has(node.data.project_id)) {
-      return byId.get(node.data.project_id);
-    }
+    const pid = node.project_id ?? node.data?.project_id;
+    if (pid && byId.has(pid)) return byId.get(pid);
     cur = parentOf.get(cur);
   }
   return null;
@@ -119,28 +118,56 @@ function walkUpToProject(startId, byId, parentOf) {
  * Чистая функция. previous: Map<id, Point>, pinned: Set<id>.
  * Возвращает Map<id, Point>. Детерминизм гарантирован mulberry32(hash32(id)).
  */
- function findAgentProject(agentId, byId, edges) {
-  const childrenOf = new Map();
+// Проект агента: поле project_id (его даёт backend по cwd) либо ребро works_in.
+function agentProjectId(agent, byId, edges) {
+  const direct = agent.project_id ?? agent.data?.project_id;
+  if (direct && byId.has(direct)) return direct;
   for (const e of edges) {
-    if (!["uses", "writes", "contains", "spawns"].includes(e.relation)) continue;
-    if (!childrenOf.has(e.source)) childrenOf.set(e.source, []);
-    childrenOf.get(e.source).push(e.target);
-  }
-  const visited = new Set([agentId]);
-  const queue = [agentId];
-  while (queue.length) {
-    const cur = queue.shift();
-    const node = byId.get(cur);
-    if (node?.type === "project") return node;
-    for (const child of childrenOf.get(cur) || []) {
-      if (visited.has(child)) continue;
-      visited.add(child);
-      queue.push(child);
-    }
+    if (e.relation === "works_in" && e.source === agent.id && byId.has(e.target)) return e.target;
   }
   return null;
 }
 
+// Родитель-агент, если он есть на сцене (spawns).
+function agentParentId(agent, byId, parentOf) {
+  const pid = parentOf.get(agent.id);
+  return pid && byId.get(pid)?.type === "agent" ? pid : null;
+}
+
+function agentDepth(agent, byId, parentOf) {
+  let depth = 0;
+  let cur = agent.id;
+  const seen = new Set();
+  while (!seen.has(cur)) {
+    seen.add(cur);
+    const pid = agentParentId(byId.get(cur), byId, parentOf);
+    if (!pid) break;
+    depth++;
+    cur = pid;
+  }
+  return depth;
+}
+
+const SCOPE_Y = { internet: ZONE.sites, lan: ZONE.lan, localhost: ZONE.localhost };
+// Инструмент стоит рядом со своим агентом, веером под ним. Угол зависит только от id инструмента,
+// поэтому позиция стабильна и не зависит от того, сколько других инструментов уже есть.
+function toolPosition(agentPos, id) {
+  const spread = ((hash32(id) % 1000) / 1000 - 0.5) * 2.2;   // ±1.1 рад вокруг «прямо вниз»
+  const angle = Math.PI / 2 + spread;
+  const radius = (agentPos.r || 28) + 52;
+  return {
+    x: agentPos.x + Math.cos(angle) * radius,
+    y: agentPos.y + Math.sin(angle) * radius * 0.8,
+    r: 18,
+  };
+}
+
+function toolOwnerId(tool, byId, parentOf) {
+  const owner = parentOf.get(tool.id) ?? tool.agent_id;
+  return owner && byId.get(owner)?.type === "agent" ? owner : null;
+}
+
+const SPAWN_RANK = { project: 0, agent: 1, folder: 2, file: 3, tool: 4, site: 5 };
 
 export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set()) {
   const pos = new Map();
@@ -154,7 +181,7 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
   const projectMembers = new Map(projects.map((p) => [p.id, []]));
   const orphans = [];
   for (const n of nodes) {
-    if (n.type === "project" || n.type === "agent" || n.type === "site") continue;
+    if (n.type === "project" || n.type === "agent" || n.type === "site" || n.type === "tool") continue;
     const project = walkUpToProject(n.id, byId, parentOf);
     if (project && projectMembers.has(project.id)) projectMembers.get(project.id).push(n);
     else orphans.push(n);
@@ -162,21 +189,24 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
 
   if (previous.size === 0) {
     // --- Полная раскладка ---
-    sites.forEach((s, i) => {
-      const x = 500 + (i - (sites.length - 1) / 2) * 140;
-      pos.set(s.id, { x, y: ZONE.sites + jitter(s.id, 20), r: 24 });
-    });
+    for (const scope of Object.keys(SCOPE_Y)) {
+      const group = sites.filter((s) => (s.scope || "internet") === scope);
+      group.forEach((s, i) => {
+        const x = 500 + (i - (group.length - 1) / 2) * 140;
+        pos.set(s.id, { x, y: SCOPE_Y[scope] + jitter(s.id, 20), r: 24 });
+      });
+    }
 
     // Сопоставить агента с проектом через рёбра
-    const agentProject = new Map();
-    for (const agent of agents) {
-      const project = findAgentProject(agent.id, byId, edges);
-      if (project) agentProject.set(agent.id, project.id);
-    }
     const agentsByProject = new Map();
     const freeAgents = [];
+    const childAgents = [];
     for (const a of agents) {
-      const pid = agentProject.get(a.id);
+      if (agentParentId(a, byId, parentOf)) {
+        childAgents.push(a);   // дочерние размещаются относительно родителя (§4.3)
+        continue;
+      }
+      const pid = agentProjectId(a, byId, edges);
       if (pid && projectMembers.has(pid)) {
         if (!agentsByProject.has(pid)) agentsByProject.set(pid, []);
         agentsByProject.get(pid).push(a);
@@ -280,6 +310,29 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
       pos.set(a.id, { x, y, r: 28 });
     });
 
+    // Дочерние агенты — вокруг родителя, от меньшей глубины к большей
+    childAgents
+      .map((a) => ({ a, depth: agentDepth(a, byId, parentOf) }))
+      .sort((l, r) => l.depth - r.depth || l.a.id.localeCompare(r.a.id))
+      .forEach(({ a }) => {
+        const pp = pos.get(parentOf.get(a.id));
+        const angle = jitter(a.id, Math.PI);
+        const radius = (pp?.r || 30) + 44 + jitter(a.id, 16);
+        pos.set(a.id, {
+          x: (pp ? pp.x : 500) + Math.cos(angle) * radius,
+          y: (pp ? pp.y : ZONE.agents) + Math.sin(angle) * radius * 0.7,
+          r: 28,
+        });
+      });
+
+    // Инструменты — рядом со своими агентами (агенты уже размещены)
+    for (const t of nodes.filter((n) => n.type === "tool")) {
+      const owner = toolOwnerId(t, byId, parentOf);
+      const ownerPos = owner ? pos.get(owner) : null;
+      if (ownerPos) pos.set(t.id, toolPosition(ownerPos, t.id));
+      else orphans.push(t);
+    }
+
     // Сироты (файлы/папки без проекта)
     orphans.forEach((n, i) => {
       const angle = i * GOLDEN;
@@ -334,13 +387,42 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
     fresh.push(p.id);
   }
 
-  // Фаза B: остальные узлы
-  for (const n of nodes) {
+  // Фаза B: остальные узлы. Порядок важен: родитель должен получить позицию раньше потомка
+  // (иначе файл, чья папка новее по id, уходил в зону сирот навсегда).
+  const depthOf = new Map(agents.map((a) => [a.id, agentDepth(a, byId, parentOf)]));
+  const ordered = nodes
+    .filter((n) => !pos.has(n.id))
+    .sort((a, b) =>
+      (SPAWN_RANK[a.type] ?? 9) - (SPAWN_RANK[b.type] ?? 9)
+      || (depthOf.get(a.id) ?? 0) - (depthOf.get(b.id) ?? 0)
+      || a.id.localeCompare(b.id));
+
+  // Сколько корневых агентов уже стоит над каждым проектом — для следующего свободного слота.
+  const rootsPerProject = new Map();
+  for (const a of agents) {
+    if (!pos.has(a.id) || agentParentId(a, byId, parentOf)) continue;
+    const pid = agentProjectId(a, byId, edges);
+    if (pid) rootsPerProject.set(pid, (rootsPerProject.get(pid) || 0) + 1);
+  }
+
+  for (const n of ordered) {
     if (pos.has(n.id)) continue;
     const parent = parentOf.get(n.id);
     const pp = parent ? pos.get(parent) : null;
+    const projectId = n.type === "agent" ? agentProjectId(n, byId, edges) : (n.project_id ?? null);
+    const projectPos = projectId ? pos.get(projectId) : null;
     let x, y, r;
-    if (pp) {
+    if (n.type === "agent" && !pp && projectPos) {
+      const slot = rootsPerProject.get(projectId) || 0;
+      rootsPerProject.set(projectId, slot + 1);
+      const row = Math.floor(slot / 4);
+      const col = slot % 4;
+      x = projectPos.x + (col - 1.5) * 70 + jitter(n.id, 5);
+      y = projectPos.y - 160 - row * 70 + jitter(n.id, 6);
+      r = 28;
+    } else if (n.type === "tool" && pp && byId.get(parent)?.type === "agent") {
+      ({ x, y, r } = toolPosition(pp, n.id));
+    } else if (pp) {
       const angle = jitter(n.id, Math.PI);
       const radius = (pp.r || 30) + 44 + jitter(n.id, 16);
       x = pp.x + Math.cos(angle) * radius;
@@ -353,8 +435,15 @@ export function layoutScene(nodes, edges, previous = new Map(), pinned = new Set
       r = 34;
     } else if (n.type === "site") {
       x = 500 + jitter(n.id, 300);
-      y = ZONE.sites + jitter(n.id, 20);
+      y = (SCOPE_Y[n.scope] ?? ZONE.sites) + jitter(n.id, 20);
       r = 24;
+    } else if (projectPos) {
+      // Файл/папка/инструмент с известным проектом, но без размещённого родителя
+      const angle = jitter(n.id, Math.PI);
+      const radius = (projectPos.r || 52) + 50 + jitter(n.id, 20);
+      x = projectPos.x + Math.cos(angle) * radius;
+      y = projectPos.y + Math.sin(angle) * radius * 0.6 + 20;
+      r = 18;
     } else {
       // Папки/файлы/тулы без проекта — в orphans-зону
       x = 500 + jitter(n.id, 260);
